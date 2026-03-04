@@ -16,3 +16,4 @@ apache/spark:4.0.1
 postgres:18
 httpd:2.4.66
 louislam/uptime-kuma:1
+protegeproject/webprotege:latest
