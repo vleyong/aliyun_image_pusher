@@ -56,17 +56,23 @@ jobs:
               full_image="${raw_image%%@*}"
               image_name_tag=$(echo "$full_image" | awk -F'/' '{print $NF}')
 
-              if [[ "$full_image" == *"/"* ]]; then
-                  org_part=$(echo "$full_image" | sed "s|\/${image_name_tag}||" | tr '/' '_')
+              # 去掉 Docker Hub 的默认前缀，官方镜像（node、nginx、elasticsearch）不加任何前缀
+              #   node:18-alpine                -> node:18-alpine
+              #   openmetadata/server:2.0.1     -> openmetadata_server:2.0.1
+              path="${full_image#docker.io/}"
+              path="${path#library/}"
+              if [[ "$path" == *"/"* ]]; then
+                  org_part=$(echo "$path" | sed "s|\/${image_name_tag}||" | tr '/' '_')
+                  repo_base="${org_part}_${image_name_tag}"
               else
-                  org_part="library"
+                  repo_base="${image_name_tag}"
               fi
 
               # 非 amd64 的镜像在名字里加上架构后缀，避免和 amd64 版本互相覆盖
               suffix=""
               [[ "$arch" != "amd64" ]] && suffix="-${arch}"
 
-              new_repo_name="${org_part}_${image_name_tag}${suffix}"
+              new_repo_name="${repo_base}${suffix}"
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_repo_name"
 
               # 目标已存在则跳过
