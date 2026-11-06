@@ -1,6 +1,3 @@
-langgenius/dify-api:latest
-langgenius/dify-sandbox:0.2.14
-ubuntu/squid:latest
-redis:6-alpine
-akyakya/doris-mcp-server:latest
-n8nio/n8n:latest
+openmetadata/server:2.0.1
+openmetadata/ingestion:2.0.1
+elasticsearch/elasticsearch:9.3.0
