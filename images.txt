@@ -1,6 +1,1 @@
-openmetadata/server:2.0.1
-openmetadata/ingestion:2.0.1
-elasticsearch:9.3.0
-node:18-alpine
-nginx:1.27-alpine
-
+openmetadata/db:2.0.1
