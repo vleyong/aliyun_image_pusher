@@ -12,6 +12,9 @@ env:
   ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
+  # 可选：配置 Docker Hub 账号，避免匿名拉取被限流
+  DOCKERHUB_USER: "${{ secrets.DOCKERHUB_USER }}"
+  DOCKERHUB_TOKEN: "${{ secrets.DOCKERHUB_TOKEN }}"
   WEBHOOK_URL: "${{ secrets.WEBHOOK_URL }}" # 在 Secrets 中配置飞书或企微地址
 
 jobs:
@@ -22,64 +25,72 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Maximize build space
-        uses: easimon/maximize-build-space@master
-        with:
-          root-reserve-mb: 2048
-          swap-size-mb: 128
-          remove-dotnet: 'true'
-          remove-haskell: 'true'
-          build-mount-path: '/var/lib/docker/'
+      # 不再需要 Maximize build space / Restart docker：
+      # skopeo 在仓库之间直接复制，不经过本地 Docker 存储，几乎不占磁盘
 
-      - name: Restart docker
-        run: sudo service docker restart
-
-        
       - name: Sync and Push to Aliyun
         id: sync_step
         run: |
-          echo "$ALIYUN_REGISTRY_PASSWORD" | docker login -u "$ALIYUN_REGISTRY_USER" --password-stdin "$ALIYUN_REGISTRY"
-          
           SYNC_SUMMARY=""
           SUCCESS_COUNT=0
           FAILURE_COUNT=0
 
+          # 源仓库凭据（可选）
+          SRC_CREDS=()
+          if [[ -n "$DOCKERHUB_USER" && -n "$DOCKERHUB_TOKEN" ]]; then
+              SRC_CREDS=(--src-creds "$DOCKERHUB_USER:$DOCKERHUB_TOKEN")
+          fi
+
           while IFS= read -r line || [ -n "$line" ]; do
-              [[ -z "$line" ]] || [[ "$line" =~ ^\s*# ]] && continue
-              
+              [[ -z "${line// }" ]] && continue
+              [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+              # 支持写法：--platform=linux/arm64 nginx:1.27
+              # 不写平台时默认 linux/amd64
+              arch="amd64"
+              if [[ "$line" =~ --platform=([^[:space:]]+) ]]; then
+                  arch="${BASH_REMATCH[1]##*/}"
+              fi
+
               raw_image=$(echo "$line" | awk '{print $NF}')
               full_image="${raw_image%%@*}"
               image_name_tag=$(echo "$full_image" | awk -F'/' '{print $NF}')
-              
+
               if [[ "$full_image" == *"/"* ]]; then
                   org_part=$(echo "$full_image" | sed "s|\/${image_name_tag}||" | tr '/' '_')
               else
                   org_part="library"
               fi
-              
-              new_repo_name="${org_part}_${image_name_tag}"
+
+              # 非 amd64 的镜像在名字里加上架构后缀，避免和 amd64 版本互相覆盖
+              suffix=""
+              [[ "$arch" != "amd64" ]] && suffix="-${arch}"
+
+              new_repo_name="${org_part}_${image_name_tag}${suffix}"
               target_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$new_repo_name"
 
-              # 检查镜像是否存在
-              if skopeo inspect docker://$target_image --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" > /dev/null 2>&1; then
-                  echo ">>> Skip: $image_name_tag"
+              # 目标已存在则跳过
+              if skopeo inspect --creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
+                   "docker://$target_image" > /dev/null 2>&1; then
+                  echo ">>> Skip: $new_repo_name"
                   continue
               fi
 
-              # 执行同步
-              if docker pull "$full_image" && docker tag "$full_image" "$target_image" && docker push "$target_image"; then
-                  docker rmi "$full_image" "$target_image"
-                  # 只有成功的才加入 SUMMARY
-                  SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ ${image_name_tag}"
+              echo ">>> Copy: $full_image ($arch) -> $new_repo_name"
+              # 仓库到仓库直接复制，不解压、不落 Docker 存储
+              if skopeo copy --retry-times 3 \
+                   --override-os linux --override-arch "$arch" \
+                   "${SRC_CREDS[@]}" \
+                   --dest-creds "$ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD" \
+                   "docker://$full_image" "docker://$target_image"; then
+                  SYNC_SUMMARY="${SYNC_SUMMARY}\n✨ ${new_repo_name}"
                   SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
               else
-                  # 只有失败的才加入 SUMMARY
-                  SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 ${image_name_tag} (推送失败)"
+                  SYNC_SUMMARY="${SYNC_SUMMARY}\n🚨 ${new_repo_name} (推送失败)"
                   FAILURE_COUNT=$((FAILURE_COUNT + 1))
               fi
           done < images.txt
 
-          # 写入环境变量
           echo "SUCCESS_COUNT=$SUCCESS_COUNT" >> $GITHUB_ENV
           echo "FAILURE_COUNT=$FAILURE_COUNT" >> $GITHUB_ENV
           {
@@ -88,28 +99,29 @@ jobs:
             echo 'EOF'
           } >> $GITHUB_ENV
 
+          # 有失败时让这次运行显示为失败，方便在 Actions 列表里一眼看到
+          [[ "$FAILURE_COUNT" -eq 0 ]]
+
       - name: 发送 Webhook 通知
         if: always()
         run: |
-          if [ -z "${{ secrets.WEBHOOK_URL }}" ]; then exit 0; fi
+          if [ -z "$WEBHOOK_URL" ]; then exit 0; fi
 
-          S_COUNT=${{ env.SUCCESS_COUNT }}
-          F_COUNT=${{ env.FAILURE_COUNT }}
+          # 上一步中途出错时这两个变量可能为空，给默认值
+          S_COUNT=${{ env.SUCCESS_COUNT || 0 }}
+          F_COUNT=${{ env.FAILURE_COUNT || 0 }}
 
-          # 1. 判定标题和主状态
-          if [ "$F_COUNT" -gt 0 ]; then
+          if [ "$F_COUNT" -gt 0 ] || [ "${{ steps.sync_step.outcome }}" = "failure" ]; then
               TITLE="❌ 阿里云镜像同步失败"
               CONTENT="⚠️ 警告：有 $F_COUNT 个镜像同步出现异常，请及时检查。"
           elif [ "$S_COUNT" -gt 0 ]; then
               TITLE="✅ 阿里云镜像同步成功"
               CONTENT="本次新增同步镜像如下："
           else
-            # 如果全是跳过，为了不骚扰，可以选择不发，或者发一条简洁的
-            TITLE="☕ 同步任务完成 (无新镜像)"
-            CONTENT="检测到 images.txt 中暂无新镜像需要同步。"
+              TITLE="☕ 同步任务完成 (无新镜像)"
+              CONTENT="检测到 images.txt 中暂无新镜像需要同步。"
           fi
 
-          # 2. 组装最终文本 (移除跳过的列表，只显示 SYNC_RESULT)
           RAW_TEXT=$(cat <<EOF
           $TITLE
           ━━━━━━━━━━━━━━━━
@@ -121,7 +133,5 @@ jobs:
           EOF
           )
 
-          # 3. 发送
           JSON_PAYLOAD=$(jq -n --arg msg "$RAW_TEXT" '{"msg_type":"text","content":{"text":$msg}}')
-          curl -X POST -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "${{ secrets.WEBHOOK_URL }}"
-      
+          curl -sS -X POST -H "Content-Type: application/json" -d "$JSON_PAYLOAD" "$WEBHOOK_URL"
